@@ -903,6 +903,11 @@ class ChatWindow(QMainWindow):
             return match.group(0)
 
         normalized = re.sub(r"(?m)^\[\s*(.+?)\s*\]$", _bracket_math, normalized)
+        normalized = re.sub(
+            r"\[\s*([^\]\n]*\\[A-Za-z][^\]\n]*)\s*\]",
+            lambda match: ChatWindow._latex_math_to_plain(match.group(1)),
+            normalized,
+        )
         return normalized
 
     @staticmethod

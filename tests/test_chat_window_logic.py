@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import pytest
+
 from gui import chat_window
 
 
@@ -27,17 +31,36 @@ class _StubStack:
 class _StubButton:
     def __init__(self) -> None:
         self.object_name: str | None = None
+        self._style = _StubStyle()
 
     def setObjectName(self, name: str) -> None:  # noqa: N802
         self.object_name = name
 
+    def style(self) -> _StubStyle:
+        return self._style
 
-class _StubTranscript:
+
+class _StubStyle:
     def __init__(self) -> None:
-        self.blocks: list[str] = []
+        self.polish_calls = 0
+        self.unpolish_calls = 0
 
-    def append(self, block: str) -> None:
-        self.blocks.append(block)
+    def polish(self, _widget) -> None:
+        self.polish_calls += 1
+
+    def unpolish(self, _widget) -> None:
+        self.unpolish_calls += 1
+
+
+@pytest.fixture
+def render_assistant_block() -> Callable[[str], str]:
+    window = chat_window.ChatWindow.__new__(chat_window.ChatWindow)
+
+    def _render(text: str) -> str:
+        block = chat_window.ChatWindow._message_html(window, "Assistant", text)
+        return " ".join(block.split())
+
+    return _render
 
 
 def test_build_agent_instructions_includes_persistent_memory_block() -> None:
@@ -74,12 +97,13 @@ def test_set_view_mode_toggles_between_chat_and_graph() -> None:
     window.view_stack = _StubStack()
     window.chat_view_button = _StubButton()
     window.graph_view_button = _StubButton()
-    window._apply_theme = lambda: None
 
     chat_window.ChatWindow._set_view_mode(window, "graph")
     assert window.view_stack.current_index == 1
     assert window.chat_view_button.object_name == "secondaryButton"
     assert window.graph_view_button.object_name == "primaryButton"
+    assert window.chat_view_button.style().polish_calls == 1
+    assert window.graph_view_button.style().polish_calls == 1
 
     chat_window.ChatWindow._set_view_mode(window, "chat")
     assert window.view_stack.current_index == 0
@@ -96,15 +120,11 @@ def test_assistant_markdown_to_html_renders_basic_markdown() -> None:
     assert "two" in rendered
 
 
-def test_append_message_uses_markdown_rendering_for_assistant() -> None:
+def test_message_html_uses_markdown_rendering_for_assistant() -> None:
     window = chat_window.ChatWindow.__new__(chat_window.ChatWindow)
-    window.transcript = _StubTranscript()
+    block = chat_window.ChatWindow._message_html(window, "Assistant", "**Hello**")
 
-    chat_window.ChatWindow._append_message(window, "Assistant", "**Hello**")
-
-    assert len(window.transcript.blocks) == 1
-    block = window.transcript.blocks[0]
-    assert "Assistant" in block
+    assert "Dost" in block
     assert "font-weight" in block
     assert "Hello" in block
 
@@ -156,3 +176,38 @@ where:
     assert "\\frac" not in rendered
     assert "(C)/(d)" in rendered
     assert "3.14159" in rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "unexpected"),
+    [
+        (
+            "**Bold**\n\n- one\n- two",
+            ["Dost", "Bold", "one", "two", "display:inline-block;background:#1e3558"],
+            ["\\pi", "\\frac"],
+        ),
+        (
+            "Pi ((\\pi)) is most basically defined as:\n[ \\pi = \\frac{C}{d} ]\n[ \\pi \\approx 3.14159 ]",
+            ["Dost", "(C)/(d)", "3.14159"],
+            [r"\pi", r"\frac", r"\approx"],
+        ),
+        (
+            r"Area is \(\pi r^2\) and circumference is [ C = 2\pi r ]",
+            ["Dost", "pi r^2", "C = 2pi r"],
+            [r"\pi", r"\("],
+        ),
+    ],
+    ids=["markdown-list", "math-snippet", "inline-and-bracket-math"],
+)
+def test_assistant_bubble_html_snapshot_cases(
+    render_assistant_block: Callable[[str], str],
+    text: str,
+    expected: list[str],
+    unexpected: list[str],
+) -> None:
+    rendered = render_assistant_block(text)
+
+    for token in expected:
+        assert token in rendered
+    for token in unexpected:
+        assert token not in rendered

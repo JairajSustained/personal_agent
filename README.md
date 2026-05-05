@@ -2,6 +2,8 @@
 
 Production-oriented desktop chat application built with Python, PySide6, and pydantic-ai.
 
+![Personal Agent screenshot](docs/screenshot.png)
+
 ## Supported providers
 
 - OpenAI

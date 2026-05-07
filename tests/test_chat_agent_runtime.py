@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from threading import RLock
 
 import pytest
 
-from agent.chat_agent import ChatAgent, Provider, ProviderConfigurationError
+from agent import MemoryStore
+from agent.chat_agent import (
+    AgentDeps,
+    ChatAgent,
+    Provider,
+    ProviderConfigurationError,
+    get_memory,
+    save_memory,
+)
 
 
 class _FakeResponse:
@@ -52,7 +61,7 @@ def test_result_text_supports_string_and_callable() -> None:
 
 def test_chat_uses_response_text_contract() -> None:
     class FakeAgentRuntime:
-        async def run(self, _message, message_history):
+        async def run(self, _message, message_history, **_kwargs):
             assert message_history == []
             return _FakeResult("ok from response.text", messages=["m1"])
 
@@ -68,7 +77,7 @@ def test_chat_uses_response_text_contract() -> None:
 
 def test_chat_stream_yields_chunks_and_updates_messages() -> None:
     class FakeAgentRuntime:
-        def run_stream(self, _message, message_history):
+        def run_stream(self, _message, message_history, **_kwargs):
             assert _message == "hi"
             assert message_history == []
             return _FakeStreamResult(["a", "b", "c"], messages=["m2"])
@@ -88,11 +97,11 @@ def test_chat_stream_yields_chunks_and_updates_messages() -> None:
 
 def test_chat_and_chat_stream_raise_on_empty_message() -> None:
     class FakeAgentRuntime:
-        async def run(self, _message, message_history):
+        async def run(self, _message, message_history, **_kwargs):
             assert message_history == []
             return _FakeResult("ignored")
 
-        def run_stream(self, _message, message_history):
+        def run_stream(self, _message, message_history, **_kwargs):
             assert message_history == []
             return _FakeStreamResult([])
 
@@ -127,78 +136,82 @@ def test_generate_title_falls_back_on_provider_error() -> None:
     assert title == "New Chat"
 
 
-def test_generate_memory_update_falls_back_to_existing_memory() -> None:
-    class FailingMemoryAgent:
-        async def run(self, _prompt):
-            raise RuntimeError("content_filter")
-
-    agent = ChatAgent.__new__(ChatAgent)
-    agent.provider = Provider.OPENAI
-    agent.model_name = "gpt-4o"
-    agent._api_key = None
-    agent._endpoint = None
-    agent._create_agent = lambda **_kwargs: FailingMemoryAgent()
-
-    current = "- Preference: prefers concise answers\n"
-    updated = asyncio.run(
-        ChatAgent.generate_memory_update(
-            agent,
-            current,
-            "Please call me Om and use bullet points",
-            "hello",
-        )
-    )
-    assert "Preference: prefers concise answers" in updated
-    assert "Name: Om" in updated
+class _FakeContext:
+    def __init__(self, deps: AgentDeps) -> None:
+        self.deps = deps
 
 
-def test_generate_memory_update_merges_model_output_and_filters_noise() -> None:
-    class SuccessfulMemoryAgent:
-        async def run(self, _prompt):
-            return _FakeResult(
-                """
-- Preference: prefers concise answers
-- Location: Bangalore
-- what is my name?
-"""
-            )
+def test_save_memory_tool_writes_fact_to_store(tmp_path: Path) -> None:
+    store = MemoryStore(file_path=tmp_path / "memory.txt")
+    ctx = _FakeContext(deps=AgentDeps(memory_store=store))
 
-    agent = ChatAgent.__new__(ChatAgent)
-    agent.provider = Provider.OPENAI
-    agent.model_name = "gpt-4o"
-    agent._api_key = None
-    agent._endpoint = None
-    agent._create_agent = lambda **_kwargs: SuccessfulMemoryAgent()
+    result = asyncio.run(save_memory(ctx, "Name: Alice"))
 
-    updated = asyncio.run(
-        ChatAgent.generate_memory_update(
-            agent,
-            "- Preference: prefers detailed answers\n",
-            "Please call me Om",
-            "Sure",
-        )
-    )
-
-    assert "Name: Om" in updated
-    assert "Preference: prefers concise answers" in updated
-    assert "Preference: prefers detailed answers" not in updated
-    assert "what is my name" not in updated.lower()
+    assert "Alice" in result
+    assert "Name: Alice" in store.load_text()
 
 
-def test_fallback_memory_update_dedupes_lines() -> None:
-    current = "- Preference: Keep responses concise\n"
-    updated = ChatAgent._fallback_memory_update(current, "Please use concise responses")
-    assert updated.count("Preference:") == 1
+def test_save_memory_tool_merges_with_existing_facts(tmp_path: Path) -> None:
+    store = MemoryStore(file_path=tmp_path / "memory.txt")
+    store.save_text("- Preference: concise answers\n")
+    ctx = _FakeContext(deps=AgentDeps(memory_store=store))
+
+    asyncio.run(save_memory(ctx, "Name: Bob"))
+
+    text = store.load_text()
+    assert "Preference: concise answers" in text
+    assert "Name: Bob" in text
+
+
+def test_save_memory_tool_returns_message_when_no_store() -> None:
+    ctx = _FakeContext(deps=AgentDeps(memory_store=None))
+
+    result = asyncio.run(save_memory(ctx, "Name: Alice"))
+
+    assert "not available" in result.lower()
+
+
+def test_get_memory_tool_retrieves_relevant_text(tmp_path: Path) -> None:
+    store = MemoryStore(file_path=tmp_path / "memory.txt")
+    store.save_text("- Name: Alice\n- Preference: concise answers\n")
+    ctx = _FakeContext(deps=AgentDeps(memory_store=store))
+
+    result = asyncio.run(get_memory(ctx, "user's name"))
+
+    assert "Alice" in result
+
+
+def test_get_memory_tool_returns_message_when_no_store() -> None:
+    ctx = _FakeContext(deps=AgentDeps(memory_store=None))
+
+    result = asyncio.run(get_memory(ctx, "anything"))
+
+    assert "not available" in result.lower()
+
+
+def test_memory_extraction_keeps_name_separate_from_preferences() -> None:
+    extracted = ChatAgent._extract_memory_candidates("My name is Alice and I like concise answers")
+
+    assert "Name: Alice" in extracted
+    assert "Name: Alice And I Like Concise Answers" not in extracted
+    assert "Preference: My name is Alice and I like concise answers" in extracted
+
+
+def test_memory_extraction_does_not_treat_location_as_name() -> None:
+    extracted = ChatAgent._extract_memory_candidates("I am from Delhi and I prefer Hindi examples")
+
+    assert all(not line.startswith("Name:") for line in extracted)
+    assert "Preference: I am from Delhi and I prefer Hindi examples" in extracted
 
 
 def test_normalize_memory_lines_filters_questions_and_keeps_name() -> None:
     memory = """
 - what is my name?
-- Jairaj Sahgal
+- Alice Smith
 - Please remember my name
 """
     normalized = ChatAgent._normalize_memory_lines(memory)
-    assert "Name: Jairaj Sahgal" in normalized
+    assert "Name: Alice Smith" in normalized
     assert all("?" not in line for line in normalized)
 
 

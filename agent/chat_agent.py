@@ -5,15 +5,24 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
+from typing import Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
 load_dotenv()
+
+
+@dataclass
+class AgentDeps:
+    """Runtime dependencies injected into pydantic-ai tool calls."""
+
+    memory_store: Any  # MemoryStore | None
 
 
 class Provider(Enum):
@@ -300,6 +309,7 @@ class ChatAgent:
         instructions: str = "You are a helpful personal assistant.",
         api_key: str | None = None,
         endpoint: str | None = None,
+        memory_store: Any = None,
     ):
         catalog = PROVIDER_MODEL_CATALOG.get(provider, [])
         default_model = catalog[0] if catalog else ""
@@ -314,6 +324,7 @@ class ChatAgent:
         self.instructions = instructions
         self._api_key = api_key
         self._endpoint = endpoint
+        self._memory_store = memory_store
         self._messages: list[ModelMessage] = []
         self._history_lock = RLock()
 
@@ -332,6 +343,7 @@ class ChatAgent:
         api_key: str | None,
         endpoint: str | None,
         instructions: str,
+        include_tools: bool = True,
     ) -> Agent:
         config = ProviderConfig(
             provider=provider,
@@ -339,6 +351,20 @@ class ChatAgent:
             api_key=api_key,
             endpoint=endpoint,
         )
+        if include_tools:
+            tool_instructions = (
+                "\n\nYou have access to these tools:\n"
+                "- save_memory(fact): Call this when the user shares personal info, preferences, or durable facts to remember across sessions. Always call this when the user says 'remember that', 'my name is', or shares preferences explicitly.\n"
+                "- get_memory(query): Call this to look up specific things the user has shared previously.\n"
+                "- search_web(query): Call this when the user asks about recent events, current data, prices, news, or anything that may have changed since your training cutoff.\n"
+                "Call save_memory proactively whenever the user shares information worth remembering long-term."
+            )
+            return Agent(
+                model=_build_model(config),
+                instructions=f"{instructions}{tool_instructions}",
+                tools=[save_memory, get_memory, search_web],
+                deps_type=AgentDeps,
+            )
         return Agent(model=_build_model(config), instructions=instructions)
 
     @staticmethod
@@ -352,16 +378,6 @@ class ChatAgent:
         if callable(text_value):
             text_value = text_value()
         return str(text_value or "")
-
-    @staticmethod
-    def _fallback_memory_update(current_memory: str, user_message: str) -> str:
-        """Deterministic memory fallback when model-based update is unavailable."""
-        existing = ChatAgent._normalize_memory_lines(current_memory)
-        extracted = ChatAgent._extract_memory_candidates(user_message)
-        merged = ChatAgent._merge_memory_lines(existing, extracted)
-        if not merged:
-            return ""
-        return "\n".join(f"- {line}" for line in merged) + "\n"
 
     @staticmethod
     def _normalize_memory_lines(memory_text: str) -> list[str]:
@@ -404,6 +420,47 @@ class ChatAgent:
         return any(lowered.startswith(prefix) for prefix in noise_prefixes)
 
     @staticmethod
+    def _clean_name_candidate(raw_name: str) -> str:
+        """Normalize a captured name while rejecting obvious non-name phrases."""
+        name = re.sub(r"\s+", " ", raw_name).strip(" .,!?;:")
+        if not name:
+            return ""
+
+        # Stop at common clause boundaries so "my name is John Doe and I like X" stores only John Doe.
+        name = re.split(
+            r"\s+(?:and|but|because|so)\s+\b(?:i|my|you|we|they|he|she|it|use|prefer|like)\b",
+            name,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" .,!?;:")
+
+        words = name.split()
+        if not words or len(words) > 4:
+            return ""
+
+        rejected_first_words = {
+            "a",
+            "an",
+            "at",
+            "from",
+            "in",
+            "into",
+            "on",
+            "the",
+            "to",
+            "with",
+            "working",
+            "using",
+        }
+        if words[0].lower() in rejected_first_words:
+            return ""
+
+        if any(any(char.isdigit() for char in word) for word in words):
+            return ""
+
+        return " ".join(part.capitalize() for part in words)
+
+    @staticmethod
     def _extract_memory_candidates(user_message: str) -> list[str]:
         cleaned = " ".join(user_message.strip().split())
         if not cleaned:
@@ -413,16 +470,15 @@ class ChatAgent:
         candidates: list[str] = []
 
         name_patterns = (
-            r"\bmy name is\s+([A-Za-z][A-Za-z\s\-']{1,50})",
-            r"\bi am\s+([A-Za-z][A-Za-z\s\-']{1,50})",
-            r"\bcall me\s+([A-Za-z][A-Za-z\s\-']{1,50})",
+            r"\bmy name is\s+([^.!?;,]{1,80})",
+            r"\bi am\s+([^.!?;,]{1,80})",
+            r"\bcall me\s+([^.!?;,]{1,80})",
         )
         for pattern in name_patterns:
             match = re.search(pattern, cleaned, flags=re.IGNORECASE)
             if match:
-                raw_name = re.sub(r"\s+", " ", match.group(1)).strip(" .,!?")
-                if raw_name:
-                    title_name = " ".join(part.capitalize() for part in raw_name.split())
+                title_name = ChatAgent._clean_name_candidate(match.group(1))
+                if title_name:
                     candidates.append(f"Name: {title_name}")
                 break
 
@@ -473,12 +529,6 @@ class ChatAgent:
             merged = merged[-80:]
         return merged
 
-    @staticmethod
-    def _parse_model_memory_text(model_output: str) -> list[str]:
-        raw_lines = [ln.strip().lstrip("-").strip() for ln in model_output.splitlines() if ln.strip()]
-        parsed = [ln[:220] for ln in raw_lines if not ChatAgent._is_noise_memory_line(ln)]
-        return ChatAgent._dedupe_lines(parsed)
-
     async def chat(self, message: str) -> str:
         """Send a message and get a response."""
         cleaned_message = message.strip()
@@ -488,7 +538,11 @@ class ChatAgent:
         with self._history_lock:
             message_history = list(self._messages)
 
-        result = await self._agent.run(cleaned_message, message_history=message_history)
+        result = await self._agent.run(
+            cleaned_message,
+            message_history=message_history,
+            deps=AgentDeps(memory_store=getattr(self, "_memory_store", None)),
+        )
 
         with self._history_lock:
             self._messages = result.all_messages()
@@ -504,7 +558,11 @@ class ChatAgent:
         with self._history_lock:
             message_history = list(self._messages)
 
-        async with self._agent.run_stream(cleaned_message, message_history=message_history) as result:
+        async with self._agent.run_stream(
+            cleaned_message,
+            message_history=message_history,
+            deps=AgentDeps(memory_store=getattr(self, "_memory_store", None)),
+        ) as result:
             async for chunk in result.stream_text(delta=True):
                 yield chunk
 
@@ -570,6 +628,7 @@ class ChatAgent:
                 "Generate a short chat title. Return only the title text. "
                 "Max 8 words. No punctuation at start or end."
             ),
+            include_tools=False,
         )
         try:
             result = await title_agent.run(f"Create a title for this request: {prompt}")
@@ -577,48 +636,6 @@ class ChatAgent:
             return title[:64] if title else "New Chat"
         except Exception:
             return "New Chat"
-
-    async def generate_memory_update(
-        self,
-        current_memory: str,
-        user_message: str,
-        assistant_message: str,
-    ) -> str:
-        """Generate an updated long-term memory text from a new chat turn."""
-        base_existing = self._normalize_memory_lines(current_memory)
-        extracted = self._extract_memory_candidates(user_message)
-
-        memory_agent = self._create_agent(
-            provider=self.provider,
-            model_name=self.model_name,
-            api_key=self._api_key,
-            endpoint=self._endpoint,
-            instructions=(
-                "Extract durable memory only. Return one fact per line. "
-                "Keep stable identity and preferences, avoid transient questions. "
-                "Do not include prompts, retries, or generic chatter."
-            ),
-        )
-
-        prompt = (
-            "Current memory:\n"
-            f"{current_memory or '(empty)'}\n\n"
-            "Latest user message:\n"
-            f"{user_message}\n\n"
-            "Latest assistant response:\n"
-            f"{assistant_message}\n\n"
-            "Return updated memory text only."
-        )
-        try:
-            result = await memory_agent.run(prompt)
-            updated = self._result_text(result).strip()
-            parsed_model = self._parse_model_memory_text(updated)
-            merged = self._merge_memory_lines(base_existing, [*extracted, *parsed_model])
-            if not merged:
-                return ""
-            return "\n".join(f"- {line}" for line in merged) + "\n"
-        except Exception:
-            return self._fallback_memory_update(current_memory, user_message)
 
     def get_available_models(self) -> list[str]:
         """Get available models for current provider."""
@@ -644,3 +661,67 @@ class ChatAgent:
         """Clear conversation history."""
         with self._history_lock:
             self._messages = []
+
+
+async def save_memory(ctx: RunContext[AgentDeps], fact: str) -> str:
+    """Save a durable fact about the user to long-term memory.
+
+    Call this when the user shares personal information, preferences, or any fact
+    that should persist across future conversations.
+    """
+    if ctx.deps.memory_store is None:
+        return "Memory not available."
+    current = ctx.deps.memory_store.load_text()
+    existing = ChatAgent._normalize_memory_lines(current)
+    new_lines = ChatAgent._normalize_memory_lines(fact)
+    if not new_lines:
+        return "Nothing to save — fact contained no usable memory lines."
+    merged = ChatAgent._merge_memory_lines(existing, new_lines)
+    text = "\n".join(f"- {line}" for line in merged) + "\n" if merged else ""
+    ctx.deps.memory_store.save_text(text)
+    return f"Saved: {new_lines[0][:60]}"
+
+
+async def get_memory(ctx: RunContext[AgentDeps], query: str) -> str:
+    """Retrieve relevant memory facts for the given query.
+
+    Call this to look up specific things the user has shared in previous sessions.
+    """
+    if ctx.deps.memory_store is None:
+        return "(memory not available)"
+    result = ctx.deps.memory_store.load_relevant_text(query)
+    return result.strip() or "(no relevant memory found)"
+
+
+async def search_web(query: str) -> str:
+    """Search the web for current information about a topic or question.
+
+    Call this when the user asks about recent events, current data, or anything
+    that may be outside the model's training knowledge.
+    """
+    import httpx
+
+    try:
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            response = await client.get("https://api.duckduckgo.com/", params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        parts: list[str] = []
+        abstract = (data.get("AbstractText") or "").strip()
+        if abstract:
+            source = (data.get("AbstractSource") or "").strip()
+            parts.append(f"{abstract} [{source}]" if source else abstract)
+
+        for item in data.get("RelatedTopics", [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            text = (item.get("Text") or "").strip()
+            url = (item.get("FirstURL") or "").strip()
+            if text:
+                parts.append(f"- {text}" + (f" ({url})" if url else ""))
+
+        return "\n".join(parts) if parts else f"No results found for: {query}"
+    except Exception as exc:  # noqa: BLE001
+        return f"Search unavailable: {exc}"

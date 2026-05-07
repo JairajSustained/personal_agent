@@ -29,9 +29,12 @@
 
 ## Memory
 
-- File-based persistent memory in plain text.
+- File-based persistent memory in plain text by default.
+- Optional Neo4j backend for graph-backed memory persistence.
+- Memory facts are scoped per user and stored as `(:PersonalAgentUser)-[:REMEMBERS]->(:MemoryFact)-[:IN_CATEGORY]->(:MemoryCategory)`.
 - Automatically updated by the agent after chat turns.
-- New conversations automatically include full memory context in agent instructions.
+- Each user prompt retrieves relevant memory facts before the response.
+- New conversations automatically include memory context in agent instructions.
 
 ## UX
 

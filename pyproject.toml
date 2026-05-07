@@ -9,6 +9,7 @@ dependencies = [
     "PySide6>=6.6.0",
     "PyYAML>=6.0.0",
     "python-dotenv>=1.0.0",
+    "neo4j>=5.25.0",
 ]
 
 [project.scripts]

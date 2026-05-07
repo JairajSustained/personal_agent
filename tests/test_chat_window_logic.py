@@ -65,12 +65,12 @@ def render_assistant_block() -> Callable[[str], str]:
 
 def test_build_agent_instructions_includes_persistent_memory_block() -> None:
     window = chat_window.ChatWindow.__new__(chat_window.ChatWindow)
-    window._memory_store = _StubMemoryStore("- Name: Om\n")
+    window._memory_store = _StubMemoryStore("- Name: John Doe\n")
 
     instructions = chat_window.ChatWindow._build_agent_instructions(window)
 
     assert "Persistent Memory:" in instructions
-    assert "- Name: Om" in instructions
+    assert "- Name: John Doe" in instructions
 
 
 def test_build_agent_instructions_uses_base_when_memory_empty() -> None:
@@ -84,12 +84,12 @@ def test_build_agent_instructions_uses_base_when_memory_empty() -> None:
 
 def test_normalize_memory_file_rewrites_noisy_memory_lines() -> None:
     window = chat_window.ChatWindow.__new__(chat_window.ChatWindow)
-    store = _StubMemoryStore("- what is my name?\n- Jairaj Sahgal\n")
+    store = _StubMemoryStore("- what is my name?\n- Alice Smith\n")
     window._memory_store = store
 
     chat_window.ChatWindow._normalize_memory_file(window)
 
-    assert store.saved == ["- Name: Jairaj Sahgal\n"]
+    assert store.saved == ["- Name: Alice Smith\n"]
 
 
 def test_set_view_mode_toggles_between_chat_and_graph() -> None:
@@ -124,7 +124,7 @@ def test_message_html_uses_markdown_rendering_for_assistant() -> None:
     window = chat_window.ChatWindow.__new__(chat_window.ChatWindow)
     block = chat_window.ChatWindow._message_html(window, "Assistant", "**Hello**")
 
-    assert "Dost" in block
+    assert "background:#171c26" in block
     assert "font-weight" in block
     assert "Hello" in block
 
@@ -183,17 +183,17 @@ where:
     [
         (
             "**Bold**\n\n- one\n- two",
-            ["Dost", "Bold", "one", "two", "display:inline-block;background:#1e3558"],
+            ["Bold", "one", "two", "display:inline-block;background:#171c26"],
             ["\\pi", "\\frac"],
         ),
         (
             "Pi ((\\pi)) is most basically defined as:\n[ \\pi = \\frac{C}{d} ]\n[ \\pi \\approx 3.14159 ]",
-            ["Dost", "(C)/(d)", "3.14159"],
+            ["(C)/(d)", "3.14159"],
             [r"\pi", r"\frac", r"\approx"],
         ),
         (
             r"Area is \(\pi r^2\) and circumference is [ C = 2\pi r ]",
-            ["Dost", "pi r^2", "C = 2pi r"],
+            ["pi r^2", "C = 2pi r"],
             [r"\pi", r"\("],
         ),
     ],
@@ -211,3 +211,33 @@ def test_assistant_bubble_html_snapshot_cases(
         assert token in rendered
     for token in unexpected:
         assert token not in rendered
+
+
+def test_apply_template_text_prefixes_only_once() -> None:
+    template = "Create a practical step-by-step plan for:\n"
+
+    first = chat_window.ChatWindow._apply_template_text(template, "Ship v1")
+    second = chat_window.ChatWindow._apply_template_text(template, first)
+
+    assert first == "Create a practical step-by-step plan for:\nShip v1"
+    assert second == first
+
+
+def test_extract_last_message_by_role() -> None:
+    transcript = [
+        {"role": "You", "content": "hello"},
+        {"role": "Assistant", "content": "hi"},
+        {"role": "You", "content": "plan this"},
+    ]
+
+    assert chat_window.ChatWindow._extract_last_message(transcript, "You") == "plan this"
+    assert chat_window.ChatWindow._extract_last_message(transcript, "Assistant") == "hi"
+    assert chat_window.ChatWindow._extract_last_message(transcript, "System") == ""
+
+
+def test_normalize_memory_editor_text_dedupes_and_formats() -> None:
+    raw = "Name: John Doe\n- Name: John Doe\nwhat is my name?\nPreference: concise answers\n"
+
+    normalized = chat_window.ChatWindow._normalize_memory_editor_text(raw)
+
+    assert normalized == "- Name: John Doe\n- Preference: concise answers\n"

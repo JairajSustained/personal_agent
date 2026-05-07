@@ -11,7 +11,17 @@ import textwrap
 from datetime import UTC, datetime, timedelta
 
 from PySide6.QtCore import QObject, QPointF, QRunnable, Qt, QThreadPool, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPalette, QPen
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPalette,
+    QPen,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -19,6 +29,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -144,58 +155,6 @@ class TitleWorker(QRunnable):
             pass
 
 
-class MemoryWorkerSignals(QObject):
-    """Signals emitted by background memory update worker."""
-
-    done = Signal(str)
-    failed = Signal(str)
-
-
-class MemoryWorker(QRunnable):
-    """Update persistent memory from the latest conversation turn."""
-
-    def __init__(self, agent: ChatAgent, current_memory: str, user_message: str, assistant_message: str) -> None:
-        super().__init__()
-        self._agent = agent
-        self._current_memory = current_memory
-        self._user_message = user_message
-        self._assistant_message = assistant_message
-        self.signals = MemoryWorkerSignals()
-
-    def run(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            task = loop.create_task(self._generate())
-            updated_memory = loop.run_until_complete(task)
-            self._safe_emit(self.signals.done, updated_memory)
-        except Exception as exc:  # noqa: BLE001
-            self._safe_emit(self.signals.failed, str(exc))
-        finally:
-            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            asyncio.set_event_loop(None)
-            loop.close()
-
-    async def _generate(self) -> str:
-        return await self._agent.generate_memory_update(
-            self._current_memory,
-            self._user_message,
-            self._assistant_message,
-        )
-
-    @staticmethod
-    def _safe_emit(signal, *args) -> None:
-        try:
-            signal.emit(*args)
-        except RuntimeError:
-            pass
-
-
 class MemoryGraphWidget(QWidget):
     """Simple memory graph view inspired by Dost-style relationship map."""
 
@@ -219,7 +178,8 @@ class MemoryGraphWidget(QWidget):
         self._nodes: list[dict] = []
         self._edges: list[tuple[int, int, str]] = []
         self._selected_idx: int | None = None
-        self.setMinimumHeight(300)
+        self.setMinimumHeight(320)
+        self.setObjectName("memoryGraph")
 
     @classmethod
     def _classify(cls, text: str) -> str:
@@ -234,42 +194,37 @@ class MemoryGraphWidget(QWidget):
             return "concept"
         return "topic"
 
-    def set_graph_data(self, memory_text: str, transcript: list[dict[str, str]]) -> None:
-        terms: list[str] = []
+    def set_graph_data(self, memory_text: str, transcript: list[dict[str, str]] = ()) -> None:  # noqa: ARG002
+        facts: list[str] = []
         for line in memory_text.splitlines():
             cleaned = line.strip().lstrip("-").strip()
             if cleaned:
-                terms.append(cleaned[:36])
+                facts.append(cleaned[:40])
 
-        for msg in transcript[-8:]:
-            content = str(msg.get("content", "")).strip()
-            if content:
-                terms.append(content[:36])
-
-        unique_terms: list[str] = []
+        unique_facts: list[str] = []
         seen: set[str] = set()
-        for term in terms:
-            key = term.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_terms.append(term)
-            if len(unique_terms) >= 14:
+        for fact in facts:
+            key = fact.lower()
+            if key not in seen:
+                seen.add(key)
+                unique_facts.append(fact)
+            if len(unique_facts) >= 20:
                 break
 
         self._nodes = [{"label": "You", "type": "person", "x": 0.5, "y": 0.5}]
         self._edges = []
 
-        if unique_terms:
+        if unique_facts:
             import math
 
-            total = len(unique_terms)
-            for idx, term in enumerate(unique_terms):
+            total = len(unique_facts)
+            for idx, fact in enumerate(unique_facts):
                 angle = (2 * math.pi * idx) / max(1, total)
-                x = 0.5 + 0.33 * math.cos(angle)
-                y = 0.5 + 0.33 * math.sin(angle)
-                node_type = self._classify(term)
-                self._nodes.append({"label": term, "type": node_type, "x": x, "y": y})
+                r = 0.36 if total <= 8 else 0.40
+                x = 0.5 + r * math.cos(angle)
+                y = 0.5 + r * math.sin(angle)
+                node_type = self._classify(fact)
+                self._nodes.append({"label": fact, "type": node_type, "x": x, "y": y})
                 self._edges.append((0, len(self._nodes) - 1, "remembers"))
 
         self.update()
@@ -279,26 +234,37 @@ class MemoryGraphWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         rect = self.rect()
-        painter.fillRect(rect, self.palette().color(QPalette.Base))
+        background = QLinearGradient(0, 0, rect.width(), rect.height())
+        background.setColorAt(0, QColor("#10131a"))
+        background.setColorAt(1, QColor("#171b24"))
+        painter.fillRect(rect, background)
 
-        if not self._nodes:
-            painter.setPen(QColor("#9196a1"))
-            painter.drawText(rect, Qt.AlignCenter, "Memory graph will appear here")
+        painter.setPen(QPen(QColor(255, 255, 255, 10), 1))
+        grid_size = 34
+        for x in range(0, rect.width(), grid_size):
+            painter.drawLine(x, 0, x, rect.height())
+        for y in range(0, rect.height(), grid_size):
+            painter.drawLine(0, y, rect.width(), y)
+
+        if not self._nodes or len(self._nodes) == 1:
+            painter.setPen(QColor("#8d96a8"))
+            painter.setFont(QFont("IBM Plex Sans", 11, QFont.Medium))
+            painter.drawText(rect, Qt.AlignCenter, "No memories yet — ask Dost to remember something")
             return
 
         points: list[QPointF] = []
         for node in self._nodes:
             points.append(QPointF(rect.width() * node["x"], rect.height() * node["y"]))
 
-        painter.setPen(QPen(QColor("#363b45"), 1.2))
+        painter.setPen(QPen(QColor("#3d4657"), 1.3))
         for a, b, label in self._edges:
             painter.drawLine(points[a], points[b])
             mid_x = (points[a].x() + points[b].x()) / 2
             mid_y = (points[a].y() + points[b].y()) / 2
-            painter.setFont(QFont("IBM Plex Sans", 7))
-            painter.setPen(QColor("#9196a1"))
+            painter.setFont(QFont("IBM Plex Sans", 7, QFont.Medium))
+            painter.setPen(QColor("#8d96a8"))
             painter.drawText(QPointF(mid_x + 3, mid_y - 3), label)
-            painter.setPen(QPen(QColor("#363b45"), 1.2))
+            painter.setPen(QPen(QColor("#3d4657"), 1.3))
 
         for idx, node in enumerate(self._nodes):
             is_person = node["type"] == "person"
@@ -308,13 +274,13 @@ class MemoryGraphWidget(QWidget):
             if self._selected_idx == idx:
                 color = color.lighter(130)
 
-            painter.setPen(QPen(QColor("#15171c"), 1.5))
+            painter.setPen(QPen(QColor("#0b0d12"), 1.8))
             painter.setBrush(QBrush(color))
             p = points[idx]
             painter.drawEllipse(p, radius, radius)
 
-            painter.setPen(QColor("#dfe0e2"))
-            painter.setFont(QFont("IBM Plex Sans", 9))
+            painter.setPen(QColor("#eef2f7"))
+            painter.setFont(QFont("IBM Plex Sans", 9, QFont.Medium))
             painter.drawText(p.x() + radius + 6, p.y() + 4, node["label"])
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -459,11 +425,19 @@ class ChatWindow(QMainWindow):
     """Main desktop window managing chat UI, memory, and persistence."""
 
     BASE_INSTRUCTIONS = "You are a helpful personal assistant."
+    PROMPT_TEMPLATES = {
+        "Summarize": "Summarize this clearly with key takeaways and next actions:\n",
+        "Plan": "Create a practical step-by-step plan for:\n",
+        "Debug": "Help me debug this. Start with likely causes, then give verification steps:\n",
+        "Review": "Review this for correctness, security, performance, and maintainability:\n",
+        "Remember": "Please remember this durable preference or fact:\n",
+    }
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Personal Agent")
-        self.resize(1200, 780)
+        self.setWindowTitle("Dost — Personal Agent")
+        self.resize(1220, 800)
+        self.setMinimumSize(980, 680)
 
         self._thread_pool = QThreadPool.globalInstance()
         self._agent: ChatAgent | None = None
@@ -471,7 +445,6 @@ class ChatWindow(QMainWindow):
         self._assistant_buffer = ""
         self._pending_user_message = ""
         self._title_generation_in_progress = False
-        self._memory_update_in_progress = False
         self._title_generated_for_conversations: set[str] = set()
         self._suppress_conversation_selection = False
 
@@ -481,89 +454,169 @@ class ChatWindow(QMainWindow):
         self._transcript_records: list[dict[str, str]] = []
 
         self._setup_ui()
+        self._setup_shortcuts()
         self._load_initial_conversation()
         self._apply_theme()
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #15171c; color: #dfe0e2; }
+            QMainWindow, QWidget {
+                background: #0f1117;
+                color: #eef2f7;
+                font-family: 'IBM Plex Sans', 'SF Pro Text', 'Segoe UI', sans-serif;
+            }
+            QWidget#sidebarPanel, QWidget#chatPanel, QWidget#composerBar {
+                background: #151923;
+                border: 1px solid #252b38;
+                border-radius: 18px;
+            }
+            QWidget#topBar {
+                background: #11151d;
+                border: 1px solid #252b38;
+                border-radius: 16px;
+            }
+            QLabel#brandTitle {
+                color: #ffffff;
+                font-size: 22px;
+                font-weight: 800;
+                letter-spacing: 0.2px;
+            }
+            QLabel#brandSubtitle, QLabel#sectionHint, QLabel#chatSubtitle {
+                color: #8d96a8;
+                font-size: 12px;
+            }
+            QLabel#chatTitle {
+                color: #ffffff;
+                font-size: 18px;
+                font-weight: 800;
+            }
             QGroupBox {
-                border: 1px solid #363b45;
-                border-radius: 12px;
-                margin-top: 12px;
-                padding-top: 12px;
-                background: #20222b;
-                font-weight: 600;
-                color: #dfe0e2;
+                border: 1px solid #252b38;
+                border-radius: 16px;
+                margin-top: 14px;
+                padding: 18px 12px 12px 12px;
+                background: #151923;
+                font-weight: 700;
+                color: #eef2f7;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-                color: #dfe0e2;
+                left: 14px;
+                padding: 0 6px;
+                color: #c9d2e3;
             }
             QListWidget, QLineEdit, QComboBox {
-                border: 1px solid #363b45;
-                border-radius: 10px;
-                padding: 7px 9px;
-                background: #20222b;
-                color: #dfe0e2;
-                selection-background-color: #252c3f;
+                border: 1px solid #2a3140;
+                border-radius: 12px;
+                padding: 9px 11px;
+                background: #10131a;
+                color: #eef2f7;
+                selection-background-color: #2f6fec;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #5b8def;
+                background: #111722;
+            }
+            QLineEdit:disabled, QComboBox:disabled {
+                color: #626b7b;
+                background: #11141b;
+                border-color: #202633;
+            }
+            QListWidget {
+                padding: 6px;
+                outline: 0;
             }
             QListWidget::item {
-                border-radius: 8px;
-                padding: 6px 8px;
-                margin: 1px;
-                color: #dfe0e2;
-            }
-            QListWidget::item:selected { background: #252c3f; color: #dfe0e2; }
-            QListWidget::item:hover { background: rgba(97,141,230,0.12); }
-            QTextBrowser {
-                border: 1px solid #363b45;
                 border-radius: 10px;
-                background: #15171c;
-                color: #dfe0e2;
+                padding: 9px 10px;
+                margin: 2px;
+                color: #dbe3ef;
+            }
+            QListWidget::item:selected {
+                background: #203150;
+                color: #ffffff;
+                border-left: 3px solid #6ea8fe;
+            }
+            QListWidget::item:hover { background: #1a2230; }
+            QTextBrowser {
+                border: 1px solid #252b38;
+                border-radius: 16px;
+                background: #0f1117;
+                color: #eef2f7;
                 font-family: 'IBM Plex Sans', 'SF Pro Text', sans-serif;
                 font-size: 13px;
+                padding: 6px;
+            }
+            QPushButton {
+                min-height: 18px;
             }
             QPushButton#primaryButton {
                 border: none;
-                border-radius: 9px;
-                padding: 8px 14px;
-                background: #618de6;
+                border-radius: 11px;
+                padding: 9px 15px;
+                background: #2f6fec;
                 color: white;
-                font-weight: 600;
+                font-weight: 700;
             }
-            QPushButton#primaryButton:hover { background: #4a7ad6; }
-            QPushButton#primaryButton:disabled { background: #3a4e8a; color: #7a8ba8; }
+            QPushButton#primaryButton:hover { background: #3f7df1; }
+            QPushButton#primaryButton:pressed { background: #265ec8; }
+            QPushButton#primaryButton:disabled { background: #253454; color: #7b8798; }
             QPushButton#secondaryButton {
-                border: 1px solid #363b45;
-                border-radius: 9px;
-                padding: 8px 14px;
-                background: #20222b;
-                color: #dfe0e2;
-                font-weight: 600;
+                border: 1px solid #2a3140;
+                border-radius: 11px;
+                padding: 9px 14px;
+                background: #151a24;
+                color: #dbe3ef;
+                font-weight: 700;
             }
-            QPushButton#secondaryButton:hover { background: #252c3f; }
+            QPushButton#secondaryButton:hover { background: #1b2432; border-color: #3b465a; }
+            QPushButton#secondaryButton:pressed { background: #111722; }
+            QPushButton#dangerButton {
+                border: 1px solid #4b2a2f;
+                border-radius: 11px;
+                padding: 9px 14px;
+                background: #21171b;
+                color: #ffb4bd;
+                font-weight: 700;
+            }
+            QPushButton#dangerButton:hover { background: #321d24; border-color: #7c3f49; }
             QStackedWidget {
-                border: 1px solid #363b45;
-                border-radius: 12px;
-                background: #15171c;
+                border: none;
+                background: transparent;
             }
-            QLabel { color: #dfe0e2; }
-            QSplitter::handle { background: #363b45; }
+            QLabel { color: #eef2f7; }
+            QSplitter::handle { background: transparent; width: 10px; }
+            QStatusBar {
+                background: #0f1117;
+                color: #8d96a8;
+                border-top: 1px solid #252b38;
+            }
             QScrollBar:vertical {
-                background: #20222b; width: 8px; border-radius: 4px; margin: 0;
+                background: transparent;
+                width: 10px;
+                border-radius: 5px;
+                margin: 2px;
             }
             QScrollBar::handle:vertical {
-                background: #363b45; border-radius: 4px; min-height: 20px;
+                background: #303848;
+                border-radius: 5px;
+                min-height: 24px;
             }
+            QScrollBar::handle:vertical:hover { background: #465165; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-            QComboBox::drop-down { border: none; }
+            QComboBox::drop-down { border: none; width: 24px; }
             QComboBox QAbstractItemView {
-                background: #20222b; border: 1px solid #363b45;
-                color: #dfe0e2; selection-background-color: #252c3f;
+                background: #151923;
+                border: 1px solid #2a3140;
+                border-radius: 10px;
+                color: #eef2f7;
+                selection-background-color: #203150;
+                padding: 4px;
+            }
+            QWidget#memoryGraph {
+                border: 1px solid #252b38;
+                border-radius: 16px;
             }
             """
         )
@@ -573,56 +626,88 @@ class ChatWindow(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
         root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(14, 14, 14, 10)
+        root_layout.setSpacing(12)
 
         splitter = QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
         root_layout.addWidget(splitter)
 
         sidebar = QWidget(self)
+        sidebar.setObjectName("sidebarPanel")
+        sidebar.setMinimumWidth(280)
+        sidebar.setMaximumWidth(340)
         sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(14, 14, 14, 14)
+        sidebar_layout.setSpacing(10)
 
-        convo_group = QGroupBox("Conversations")
-        convo_layout = QVBoxLayout(convo_group)
+        brand_label = QLabel("Dost")
+        brand_label.setObjectName("brandTitle")
+        brand_subtitle = QLabel("Personal memory assistant")
+        brand_subtitle.setObjectName("brandSubtitle")
 
-        self.search_input = QLineEdit(convo_group)
-        self.search_input.setPlaceholderText("Search chats...")
+        self.new_chat_button = QPushButton("New chat")
+        self.new_chat_button.setObjectName("primaryButton")
 
-        convo_actions = QHBoxLayout()
-        self.new_chat_button = QPushButton("New Chat")
-        self.new_chat_button.setObjectName("secondaryButton")
+        self.search_input = QLineEdit(sidebar)
+        self.search_input.setPlaceholderText("Search")
+
+        self.conversation_list = QListWidget(sidebar)
+
+        quiet_actions = QHBoxLayout()
+        quiet_actions.setSpacing(8)
         self.pin_chat_button = QPushButton("Pin")
         self.pin_chat_button.setObjectName("secondaryButton")
-        self.export_chat_button = QPushButton("Export MD")
+        self.export_chat_button = QPushButton("Export")
         self.export_chat_button.setObjectName("secondaryButton")
         self.delete_chat_button = QPushButton("Delete")
-        self.delete_chat_button.setObjectName("secondaryButton")
-        convo_actions.addWidget(self.new_chat_button)
-        convo_actions.addWidget(self.pin_chat_button)
-        convo_actions.addWidget(self.export_chat_button)
-        convo_actions.addWidget(self.delete_chat_button)
-
-        self.conversation_list = QListWidget(convo_group)
-
-        convo_layout.addLayout(convo_actions)
-        convo_layout.addWidget(self.search_input)
-        convo_layout.addWidget(self.conversation_list)
+        self.delete_chat_button.setObjectName("dangerButton")
+        self.settings_toggle_button = QPushButton("Settings")
+        self.settings_toggle_button.setObjectName("secondaryButton")
+        quiet_actions.addWidget(self.pin_chat_button)
+        quiet_actions.addWidget(self.export_chat_button)
+        quiet_actions.addWidget(self.delete_chat_button)
+        quiet_actions.addWidget(self.settings_toggle_button)
 
         self.settings_panel = SettingsPanel(self)
+        self.settings_panel.setVisible(False)
         self.settings_panel.settings_applied.connect(self._apply_settings)
 
-        sidebar_layout.addWidget(convo_group)
+        sidebar_layout.addWidget(brand_label)
+        sidebar_layout.addWidget(brand_subtitle)
+        sidebar_layout.addSpacing(4)
+        sidebar_layout.addWidget(self.new_chat_button)
+        sidebar_layout.addWidget(self.search_input)
+        sidebar_layout.addWidget(self.conversation_list, 1)
+        sidebar_layout.addLayout(quiet_actions)
         sidebar_layout.addWidget(self.settings_panel)
 
         chat_container = QWidget(self)
+        chat_container.setObjectName("chatPanel")
         chat_layout = QVBoxLayout(chat_container)
+        chat_layout.setContentsMargins(14, 14, 14, 14)
+        chat_layout.setSpacing(12)
 
-        view_switch = QHBoxLayout()
+        top_bar = QWidget(chat_container)
+        top_bar.setObjectName("topBar")
+        top_bar_layout = QHBoxLayout(top_bar)
+        top_bar_layout.setContentsMargins(14, 10, 10, 10)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(1)
+        self.chat_title_label = QLabel("Chat")
+        self.chat_title_label.setObjectName("chatTitle")
+        chat_subtitle = QLabel("Ask, plan, remember — without clutter")
+        chat_subtitle.setObjectName("chatSubtitle")
+        title_stack.addWidget(self.chat_title_label)
+        title_stack.addWidget(chat_subtitle)
         self.chat_view_button = QPushButton("Chat")
         self.chat_view_button.setObjectName("primaryButton")
-        self.graph_view_button = QPushButton("Memory Graph")
+        self.graph_view_button = QPushButton("Memory")
         self.graph_view_button.setObjectName("secondaryButton")
-        view_switch.addWidget(self.chat_view_button)
-        view_switch.addWidget(self.graph_view_button)
-        view_switch.addStretch(1)
+        top_bar_layout.addLayout(title_stack)
+        top_bar_layout.addStretch(1)
+        top_bar_layout.addWidget(self.chat_view_button)
+        top_bar_layout.addWidget(self.graph_view_button)
 
         self.view_stack = QStackedWidget(chat_container)
 
@@ -632,10 +717,38 @@ class ChatWindow(QMainWindow):
         self.transcript = QTextBrowser(chat_page)
         self.transcript.setOpenExternalLinks(True)
 
-        input_row = QHBoxLayout()
+        composer = QWidget(chat_page)
+        composer.setObjectName("composerBar")
+        input_row = QHBoxLayout(composer)
+        input_row.setContentsMargins(10, 10, 10, 10)
+        input_row.setSpacing(8)
         self.input_field = QLineEdit(chat_page)
-        self.input_field.setPlaceholderText("Ask anything...")
+        self.input_field.setPlaceholderText("Message Dost...")
         self.input_field.returnPressed.connect(self._send_message)
+
+        self.template_combo = QComboBox(chat_page)
+        self.template_combo.addItems(list(self.PROMPT_TEMPLATES.keys()))
+        self.template_combo.setMinimumWidth(128)
+
+        self.template_apply_button = QPushButton("Use", chat_page)
+        self.template_apply_button.setObjectName("secondaryButton")
+        self.template_apply_button.clicked.connect(self._apply_selected_template)
+
+        self.retry_button = QPushButton("Retry", chat_page)
+        self.retry_button.setObjectName("secondaryButton")
+        self.retry_button.clicked.connect(self._retry_last_user_message)
+
+        self.copy_last_button = QPushButton("Copy Last", chat_page)
+        self.copy_last_button.setObjectName("secondaryButton")
+        self.copy_last_button.clicked.connect(self._copy_last_assistant_response)
+
+        self.attach_button = QPushButton("Attach", chat_page)
+        self.attach_button.setObjectName("secondaryButton")
+        self.attach_button.clicked.connect(self._attach_file)
+
+        self.memory_edit_button = QPushButton("Edit Memory", chat_page)
+        self.memory_edit_button.setObjectName("secondaryButton")
+        self.memory_edit_button.clicked.connect(self._edit_memory)
 
         self.send_button = QPushButton("Send", chat_page)
         self.send_button.setObjectName("primaryButton")
@@ -645,16 +758,23 @@ class ChatWindow(QMainWindow):
         self.clear_button.setObjectName("secondaryButton")
         self.clear_button.clicked.connect(self._clear_chat)
 
-        input_row.addWidget(self.input_field)
-        input_row.addWidget(self.send_button)
+        input_row.addWidget(self.input_field, 1)
+        input_row.addWidget(self.template_combo)
+        input_row.addWidget(self.template_apply_button)
+        input_row.addWidget(self.retry_button)
+        input_row.addWidget(self.copy_last_button)
+        input_row.addWidget(self.attach_button)
+        input_row.addWidget(self.memory_edit_button)
         input_row.addWidget(self.clear_button)
+        input_row.addWidget(self.send_button)
 
-        chat_page_layout.addWidget(self.transcript)
-        chat_page_layout.addLayout(input_row)
+        chat_page_layout.addWidget(self.transcript, 1)
+        chat_page_layout.addWidget(composer)
 
         graph_page = QWidget()
         graph_layout = QVBoxLayout(graph_page)
-        self.graph_hint = QLabel("Interactive map of remembered context")
+        self.graph_hint = QLabel("Remembered context map")
+        self.graph_hint.setObjectName("sectionHint")
         self.memory_graph = MemoryGraphWidget(graph_page)
         graph_layout.addWidget(self.graph_hint)
         graph_layout.addWidget(self.memory_graph)
@@ -662,8 +782,8 @@ class ChatWindow(QMainWindow):
         self.view_stack.addWidget(chat_page)
         self.view_stack.addWidget(graph_page)
 
-        chat_layout.addLayout(view_switch)
-        chat_layout.addWidget(self.view_stack)
+        chat_layout.addWidget(top_bar)
+        chat_layout.addWidget(self.view_stack, 1)
 
         splitter.addWidget(sidebar)
         splitter.addWidget(chat_container)
@@ -673,11 +793,57 @@ class ChatWindow(QMainWindow):
         self.pin_chat_button.clicked.connect(self._toggle_pin_current_chat)
         self.export_chat_button.clicked.connect(self._export_current_chat_markdown)
         self.delete_chat_button.clicked.connect(self._delete_current_chat)
+        self.settings_toggle_button.clicked.connect(self._toggle_settings_panel)
         self.conversation_list.itemSelectionChanged.connect(self._on_conversation_selected)
         self.search_input.textChanged.connect(lambda _text: self._refresh_conversation_list())
         self.chat_view_button.clicked.connect(lambda: self._set_view_mode("chat"))
         self.graph_view_button.clicked.connect(lambda: self._set_view_mode("graph"))
         self._set_view_mode("chat")
+
+    def _setup_shortcuts(self) -> None:
+        """Register keyboard shortcuts for common desktop actions."""
+        self._shortcuts = [
+            QShortcut(QKeySequence("Ctrl+N"), self),
+            QShortcut(QKeySequence("Ctrl+F"), self),
+            QShortcut(QKeySequence("Ctrl+E"), self),
+            QShortcut(QKeySequence("Ctrl+R"), self),
+            QShortcut(QKeySequence("Ctrl+Shift+C"), self),
+            QShortcut(QKeySequence("Ctrl+M"), self),
+            QShortcut(QKeySequence("Ctrl+Shift+A"), self),
+        ]
+        self._shortcuts[0].activated.connect(self._new_chat)
+        self._shortcuts[1].activated.connect(self.search_input.setFocus)
+        self._shortcuts[2].activated.connect(self._export_current_chat_markdown)
+        self._shortcuts[3].activated.connect(self._retry_last_user_message)
+        self._shortcuts[4].activated.connect(self._copy_last_assistant_response)
+        self._shortcuts[5].activated.connect(self._edit_memory)
+        self._shortcuts[6].activated.connect(self._attach_file)
+
+    @staticmethod
+    def _apply_template_text(template: str, current: str) -> str:
+        body = current.lstrip()
+        if body.startswith(template):
+            return current
+        return f"{template}{current}" if current else template
+
+    @staticmethod
+    def _extract_last_message(transcript: list[dict[str, str]], role: str) -> str:
+        for message in reversed(transcript):
+            if message.get("role") == role:
+                return str(message.get("content", "")).strip()
+        return ""
+
+    @staticmethod
+    def _normalize_memory_editor_text(text: str) -> str:
+        normalized_lines = ChatAgent._normalize_memory_lines(text)
+        normalized = "\n".join(f"- {line}" for line in normalized_lines).strip()
+        return f"{normalized}\n" if normalized else ""
+
+    def _toggle_settings_panel(self) -> None:
+        """Keep advanced model settings out of the main view until needed."""
+        visible = not self.settings_panel.isVisible()
+        self.settings_panel.setVisible(visible)
+        self.settings_toggle_button.setText("Hide" if visible else "Settings")
 
     def _refresh_conversation_list(self) -> None:
         """Render conversations in sidebar grouped by date, honoring search and pin state."""
@@ -806,10 +972,14 @@ class ChatWindow(QMainWindow):
             self.view_stack.setCurrentIndex(1)
             self.chat_view_button.setObjectName("secondaryButton")
             self.graph_view_button.setObjectName("primaryButton")
+            if hasattr(self, "chat_title_label"):
+                self.chat_title_label.setText("Memory")
         else:
             self.view_stack.setCurrentIndex(0)
             self.chat_view_button.setObjectName("primaryButton")
             self.graph_view_button.setObjectName("secondaryButton")
+            if hasattr(self, "chat_title_label"):
+                self.chat_title_label.setText("Chat")
         self.chat_view_button.style().unpolish(self.chat_view_button)
         self.chat_view_button.style().polish(self.chat_view_button)
         self.graph_view_button.style().unpolish(self.graph_view_button)
@@ -823,25 +993,24 @@ class ChatWindow(QMainWindow):
     def _message_html(self, role: str, text: str, timestamp: str | None = None) -> str:
         """Return HTML for a single chat message."""
         safe_text = html.escape(text).replace("\n", "<br>")
-        ts_bit = f"<br><font size='1' color='#9196a1'>{html.escape(timestamp)}</font>" if timestamp else ""
+        ts_bit = f"<br><font size='1' color='#7f8998'>{html.escape(timestamp)}</font>" if timestamp else ""
         role_lower = role.lower()
         if role_lower == "you":
             return (
-                f"<p align='right' style='margin:4px 0;'>"
-                f"<span style='display:inline-block;background:#2d5fce;color:#ffffff;"
-                f"padding:8px 14px;border-radius:14px;'>{safe_text}</span>"
+                f"<p align='right' style='margin:10px 0;'>"
+                f"<span style='display:inline-block;background:#2f6fec;color:#ffffff;"
+                f"padding:10px 14px;border-radius:16px;'>{safe_text}</span>"
                 f"{ts_bit}</p>"
             )
         if role_lower == "assistant":
             rendered = self._assistant_markdown_to_html(text)
             return (
-                f"<p align='left' style='margin:4px 0;'>"
-                f"<font color='#618de6'><b>Dost</b></font>&nbsp;"
-                f"<span style='display:inline-block;background:#1e3558;color:#dfe0e2;"
-                f"padding:8px 14px;border-radius:14px;'>{rendered}</span>"
+                f"<p align='left' style='margin:10px 0;'>"
+                f"<span style='display:inline-block;background:#171c26;color:#eef2f7;"
+                f"border:1px solid #252b38;padding:10px 14px;border-radius:16px;'>{rendered}</span>"
                 f"{ts_bit}</p>"
             )
-        return f"<p><font color='#c4624a'><b>{html.escape(role)}:</b> {safe_text}</font></p>"
+        return f"<p><font color='#ffb4bd'><b>{html.escape(role)}:</b> {safe_text}</font></p>"
 
     def _build_full_html(self, extra: str = "") -> str:
         """Build a complete HTML document for setHtml(), avoiding Qt append() state leaks."""
@@ -852,10 +1021,18 @@ class ChatWindow(QMainWindow):
         if extra:
             parts.append(extra)
         body = "".join(parts)
+        if not body:
+            body = (
+                "<div style='height:520px;display:flex;align-items:center;justify-content:center;'>"
+                "<div style='text-align:center;color:#8d96a8;'>"
+                "<div style='font-size:28px;color:#eef2f7;font-weight:700;margin-bottom:8px;'>What do you want to do?</div>"
+                "<div>Start with a question, a plan, or something you want Dost to remember.</div>"
+                "</div></div>"
+            )
         return (
             "<html><head></head>"
-            "<body style='background-color:#15171c;color:#dfe0e2;"
-            "font-family:\"IBM Plex Sans\",\"SF Pro Text\",sans-serif;font-size:13px;margin:8px;'>"
+            "<body style='background-color:#0f1117;color:#eef2f7;"
+            "font-family:\"IBM Plex Sans\",\"SF Pro Text\",sans-serif;font-size:13px;margin:10px;'>"
             f"{body}</body></html>"
         )
 
@@ -957,10 +1134,9 @@ class ChatWindow(QMainWindow):
             extra = self._message_html("Assistant", self._assistant_buffer)
         else:
             extra = (
-                "<p align='left' style='margin:4px 0;'>"
-                "<font color='#618de6'><b>Dost</b></font>&nbsp;"
-                "<span style='display:inline-block;background:#1e3558;color:#9196a1;"
-                "padding:8px 14px;border-radius:14px;'>&#9679; &#9679; &#9679;</span></p>"
+                "<p align='left' style='margin:10px 0;'>"
+                "<span style='display:inline-block;background:#171c26;color:#8d96a8;"
+                "border:1px solid #252b38;padding:10px 14px;border-radius:16px;'>&#9679; &#9679; &#9679;</span></p>"
             )
         self.transcript.setHtml(self._build_full_html(extra))
         self.transcript.verticalScrollBar().setValue(self.transcript.verticalScrollBar().maximum())
@@ -971,16 +1147,23 @@ class ChatWindow(QMainWindow):
         self.settings_panel.apply_button.setEnabled(enabled)
         self.settings_panel.refresh_button.setEnabled(enabled)
 
-    def _build_agent_instructions(self) -> str:
-        """Compose runtime agent instructions including persisted memory."""
-        memory_text = self._memory_store.load_text().strip()
+    def _build_agent_instructions(self, query: str | None = None) -> str:
+        """Compose runtime agent instructions including persisted/retrieved memory."""
+        if query and hasattr(self._memory_store, "load_relevant_text"):
+            memory_text = self._memory_store.load_relevant_text(query).strip()
+            if not memory_text:
+                memory_text = self._memory_store.load_text().strip()
+        else:
+            memory_text = self._memory_store.load_text().strip()
+
         if not memory_text:
             return self.BASE_INSTRUCTIONS
 
+        heading = "Relevant Persistent Memory" if query else "Persistent Memory"
         return (
             f"{self.BASE_INSTRUCTIONS}\n\n"
-            "Persistent Memory:\n"
-            "Use this memory as long-term context for all new conversations.\n"
+            f"{heading}:\n"
+            "Use this memory as long-term context for this response.\n"
             "If the user asks to override memory in this chat, follow the user.\n"
             f"---\n{memory_text}\n---"
         )
@@ -998,7 +1181,7 @@ class ChatWindow(QMainWindow):
         """Apply provider/model settings and reconfigure the active agent."""
         try:
             if self._agent is None:
-                self._agent = ChatAgent(**config, instructions=self._build_agent_instructions())
+                self._agent = ChatAgent(**config, instructions=self._build_agent_instructions(), memory_store=self._memory_store)
             else:
                 self._agent.reconfigure(
                     **config,
@@ -1037,6 +1220,68 @@ class ChatWindow(QMainWindow):
                     return textwrap.shorten(title, width=48, placeholder="...")
         return "New Chat"
 
+    def _apply_selected_template(self) -> None:
+        template_name = self.template_combo.currentText().strip()
+        template = self.PROMPT_TEMPLATES.get(template_name)
+        if not template:
+            return
+        self.input_field.setText(self._apply_template_text(template, self.input_field.text()))
+        self.input_field.setFocus()
+
+    def _copy_last_assistant_response(self) -> None:
+        content = self._extract_last_message(self._transcript_records, "Assistant")
+        if not content:
+            self.statusBar().showMessage("No assistant response to copy")
+            return
+        QApplication.clipboard().setText(content)
+        self.statusBar().showMessage("Copied last assistant response")
+
+    def _retry_last_user_message(self) -> None:
+        if self._streaming or self._agent is None:
+            return
+        message = self._extract_last_message(self._transcript_records, "You")
+        if not message:
+            self.statusBar().showMessage("No previous user message to retry")
+            return
+        self.input_field.setText(message)
+        self._send_message()
+
+    def _edit_memory(self) -> None:
+        current = self._memory_store.load_text()
+        updated, accepted = QInputDialog.getMultiLineText(self, "Edit Memory", "Persistent memory", current)
+        if not accepted:
+            return
+
+        normalized = self._normalize_memory_editor_text(updated)
+        self._memory_store.save_text(normalized)
+        if self._agent is not None:
+            self._agent.update_instructions(self._build_agent_instructions())
+        self._refresh_graph_view()
+        self.statusBar().showMessage("Memory updated")
+
+    def _attach_file(self) -> None:
+        """Open a file and prepend its content as context to the input field."""
+        file_filter = "Text files (*.txt *.md *.py *.js *.ts *.json *.yaml *.yml *.csv *.html *.css *.sh *.toml *.ini *.log)"
+        file_path, _ = QFileDialog.getOpenFileName(self, "Attach File", "", file_filter)
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+
+            if len(content) > 12_000:
+                content = content[:12_000] + "\n...(truncated)"
+
+            filename = os.path.basename(file_path)
+            ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+            prefix = f"[File: {filename}]\n```{ext}\n{content}\n```\n\n"
+            self.input_field.setText(prefix + self.input_field.text())
+            self.input_field.setFocus()
+            self.statusBar().showMessage(f"Attached: {filename} ({len(content):,} chars)")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Attach File", f"Could not read file:\n{exc}")
+
     def _send_message(self) -> None:
         """Queue a user message for streaming response generation."""
         if self._streaming or self._agent is None:
@@ -1045,6 +1290,9 @@ class ChatWindow(QMainWindow):
         message = self.input_field.text().strip()
         if not message:
             return
+
+        if self._agent is not None:
+            self._agent.update_instructions(self._build_agent_instructions(query=message))
 
         self._streaming = True
         self._assistant_buffer = ""
@@ -1071,7 +1319,7 @@ class ChatWindow(QMainWindow):
         self._render_transcript()
         self._persist_active_conversation()
         self._maybe_generate_model_title()
-        self._maybe_update_memory()
+        self._refresh_graph_view()
 
     def _on_response_failed(self, error_message: str) -> None:
         self._streaming = False
@@ -1148,46 +1396,6 @@ class ChatWindow(QMainWindow):
 
     def _on_title_generation_failed(self, _error_message: str) -> None:
         self._title_generation_in_progress = False
-
-    def _maybe_update_memory(self) -> None:
-        """Ask the model to maintain long-term memory from latest chat turn."""
-        if self._agent is None or self._memory_update_in_progress:
-            return
-
-        user_message = ""
-        assistant_message = ""
-        for message in reversed(self._transcript_records):
-            role = message.get("role")
-            if not assistant_message and role == "Assistant":
-                assistant_message = str(message.get("content", ""))
-            elif not user_message and role == "You":
-                user_message = str(message.get("content", ""))
-            if user_message and assistant_message:
-                break
-
-        if not user_message or not assistant_message:
-            return
-
-        self._memory_update_in_progress = True
-        worker = MemoryWorker(
-            agent=self._agent,
-            current_memory=self._memory_store.load_text(),
-            user_message=user_message,
-            assistant_message=assistant_message,
-        )
-        worker.signals.done.connect(self._on_memory_updated)
-        worker.signals.failed.connect(self._on_memory_update_failed)
-        self._thread_pool.start(worker)
-
-    def _on_memory_updated(self, updated_memory: str) -> None:
-        self._memory_update_in_progress = False
-        self._memory_store.save_text(updated_memory)
-        if self._agent is not None:
-            self._agent.update_instructions(self._build_agent_instructions())
-        self._refresh_graph_view()
-
-    def _on_memory_update_failed(self, _error_message: str) -> None:
-        self._memory_update_in_progress = False
 
     def _clear_chat(self) -> None:
         self._transcript_records = []
@@ -1267,17 +1475,17 @@ def main() -> None:
     app.setFont(QFont("IBM Plex Sans", 10))
 
     palette = QPalette()
-    palette.setColor(QPalette.Window, QColor("#15171c"))
-    palette.setColor(QPalette.WindowText, QColor("#dfe0e2"))
-    palette.setColor(QPalette.Base, QColor("#20222b"))
-    palette.setColor(QPalette.AlternateBase, QColor("#252c3f"))
-    palette.setColor(QPalette.Text, QColor("#dfe0e2"))
-    palette.setColor(QPalette.Button, QColor("#20222b"))
-    palette.setColor(QPalette.ButtonText, QColor("#dfe0e2"))
-    palette.setColor(QPalette.Highlight, QColor("#618de6"))
+    palette.setColor(QPalette.Window, QColor("#0f1117"))
+    palette.setColor(QPalette.WindowText, QColor("#eef2f7"))
+    palette.setColor(QPalette.Base, QColor("#10131a"))
+    palette.setColor(QPalette.AlternateBase, QColor("#151923"))
+    palette.setColor(QPalette.Text, QColor("#eef2f7"))
+    palette.setColor(QPalette.Button, QColor("#151a24"))
+    palette.setColor(QPalette.ButtonText, QColor("#eef2f7"))
+    palette.setColor(QPalette.Highlight, QColor("#2f6fec"))
     palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-    palette.setColor(QPalette.ToolTipBase, QColor("#252c3f"))
-    palette.setColor(QPalette.ToolTipText, QColor("#dfe0e2"))
+    palette.setColor(QPalette.ToolTipBase, QColor("#151923"))
+    palette.setColor(QPalette.ToolTipText, QColor("#eef2f7"))
     app.setPalette(palette)
 
     window = ChatWindow()

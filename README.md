@@ -51,7 +51,30 @@ uv run personal-agent
 - Default memory file: `~/.personal_agent/memory.txt`
 - Optional override: `MEMORY_FILE_PATH`
 - Memory is updated automatically by the agent from conversation turns.
-- New chats inherit full memory context from the file.
+- Chat turns retrieve relevant memory facts for the current prompt using deterministic lexical ranking.
+- New chats inherit memory context automatically.
+
+### Optional Neo4j graph memory
+
+By default the app uses the plain-text memory file. To persist memory facts in Neo4j as graph-backed memory, set:
+
+```bash
+MEMORY_BACKEND=neo4j
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=<password>
+# Optional:
+NEO4J_DATABASE=neo4j
+NEO4J_USER_ID=default
+```
+
+Neo4j stores facts like:
+
+```cypher
+(:PersonalAgentUser {id})-[:REMEMBERS]->(:MemoryFact {user_id, key})-[:IN_CATEGORY]->(:MemoryCategory)
+```
+
+A plain-text mirror is still written to `MEMORY_FILE_PATH` so memory survives if Neo4j is unavailable. `NEO4J_USER_ID` scopes fact nodes per user.
 
 ## Documentation
 

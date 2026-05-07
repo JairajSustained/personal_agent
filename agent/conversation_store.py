@@ -208,6 +208,117 @@ class ConversationStore:
 
         return "\n".join(lines).strip() + "\n"
 
+    def rename_conversation(self, conversation_id: str, title: str) -> bool:
+        """Rename a conversation and return whether it was found."""
+        clean_title = title.strip()
+        if not clean_title:
+            return False
+
+        state = self.load()
+        for item in state.get("conversations", []):
+            if not isinstance(item, dict) or item.get("id") != conversation_id:
+                continue
+            item["title"] = clean_title[:120]
+            item["updated_at"] = _now_iso()
+            self.save(state)
+            return True
+        return False
+
+    def duplicate_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        """Create a copy of an existing conversation and make the copy active."""
+        state = self.load()
+        conversations = state.get("conversations", [])
+        source = next(
+            (item for item in conversations if isinstance(item, dict) and item.get("id") == conversation_id),
+            None,
+        )
+        if source is None:
+            return None
+
+        now = _now_iso()
+        copied = dict(source)
+        copied["id"] = uuid.uuid4().hex
+        copied["title"] = f"{source.get('title', 'New Chat')} (copy)"
+        copied["created_at"] = now
+        copied["updated_at"] = now
+        copied["transcript"] = list(source.get("transcript", []))
+        copied["pinned"] = False
+        conversations.append(copied)
+        state["active_id"] = copied["id"]
+        self.save(state)
+        return self.get_conversation(copied["id"])
+
+    def export_all_json(self) -> str:
+        """Export the complete conversation store as formatted JSON."""
+        return json.dumps(self.load(), indent=2, ensure_ascii=False)
+
+    def import_from_json(self, payload: str) -> int:
+        """Merge conversations from an exported JSON payload and return import count."""
+        try:
+            imported_state = json.loads(payload)
+        except json.JSONDecodeError:
+            return 0
+        if not isinstance(imported_state, dict):
+            return 0
+
+        incoming = imported_state.get("conversations", [])
+        if not isinstance(incoming, list):
+            return 0
+
+        state = self.load()
+        conversations = state.get("conversations", [])
+        existing_ids = {item.get("id") for item in conversations if isinstance(item, dict)}
+        imported_count = 0
+        for item in incoming:
+            if not isinstance(item, dict):
+                continue
+            copied = dict(item)
+            copied_id = str(copied.get("id") or uuid.uuid4().hex)
+            if copied_id in existing_ids:
+                copied_id = uuid.uuid4().hex
+            copied["id"] = copied_id
+            copied.setdefault("title", "Imported Chat")
+            copied.setdefault("provider", Provider.OPENAI.value)
+            copied.setdefault("model_name", "")
+            copied.setdefault("created_at", _now_iso())
+            copied.setdefault("updated_at", _now_iso())
+            copied.setdefault("transcript", [])
+            copied.setdefault("history_json", "[]")
+            copied["pinned"] = bool(copied.get("pinned", False))
+            conversations.append(copied)
+            existing_ids.add(copied_id)
+            imported_count += 1
+
+        if imported_count:
+            state["active_id"] = conversations[-1].get("id")
+            self.save(state)
+        return imported_count
+
+    def conversation_stats(self, conversation_id: str) -> dict[str, int]:
+        """Return basic message and word counts for one conversation."""
+        record = self.get_conversation(conversation_id)
+        if record is None:
+            return {"messages": 0, "user_messages": 0, "assistant_messages": 0, "words": 0}
+
+        user_messages = 0
+        assistant_messages = 0
+        words = 0
+        for msg in record.transcript:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", ""))
+            if role == "You":
+                user_messages += 1
+            elif role == "Assistant":
+                assistant_messages += 1
+            words += len(str(msg.get("content", "")).split())
+        return {
+            "messages": len(record.transcript),
+            "user_messages": user_messages,
+            "assistant_messages": assistant_messages,
+            "words": words,
+        }
+
     def search_conversations(self, query: str) -> list[ConversationRecord]:
         """Search conversations by title, metadata, and transcript text."""
         term = query.strip().lower()

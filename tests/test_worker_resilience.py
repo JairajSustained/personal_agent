@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gui.chat_window import ChatWorker, MemoryWorker, TitleWorker
+from gui.chat_window import ChatWorker, TitleWorker
 
 
 class _SignalRaisesRuntimeError:
@@ -20,18 +20,6 @@ def test_safe_emit_helpers_swallow_runtime_error() -> None:
 
     ChatWorker._safe_emit(signal, "x")
     TitleWorker._safe_emit(signal, "x")
-    MemoryWorker._safe_emit(signal, "x")
-
-
-def test_memory_worker_run_survives_emit_and_model_errors() -> None:
-    class _FailingAgent:
-        async def generate_memory_update(self, *_args, **_kwargs):
-            raise RuntimeError("content_filter")
-
-    worker = MemoryWorker(_FailingAgent(), "mem", "user", "assistant")
-    worker.signals = _FakeSignals()
-
-    worker.run()
 
 
 def test_title_worker_run_survives_emit_and_model_errors() -> None:
